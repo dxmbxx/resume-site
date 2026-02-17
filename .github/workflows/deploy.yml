@@ -33,33 +33,43 @@ jobs:
           push: true
           tags: ${{ env.IMAGE }}
 
+      - name: Write SSH key
+        shell: bash
+        run: |
+          set -e
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          # ВАЖНО: сохраняем ключ как есть, с переносами строк
+          cat > ~/.ssh/id_deploy <<'KEY'
+          ${{ secrets.SSH_KEY }}
+          KEY
+          chmod 600 ~/.ssh/id_deploy
+          # опционально: выключаем StrictHostKeyChecking, чтобы не упираться в known_hosts
+          printf "Host *\n  StrictHostKeyChecking no\n  UserKnownHostsFile=/dev/null\n" > ~/.ssh/config
+          chmod 600 ~/.ssh/config
+
       - name: Deploy over SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_KEY }}
           port: ${{ secrets.SSH_PORT || 22 }}
+          key_path: ~/.ssh/id_deploy
           script: |
             set -e
             mkdir -p /opt/resume-site
             cd /opt/resume-site
-
-            # обновляем Caddyfile с доменом (один раз, но пусть будет идемпотентно)
             cat > Caddyfile << 'EOF'
             ${{ secrets.DOMAIN }} {
               encode gzip
               reverse_proxy app:80
             }
             EOF
-
-            # compose.yaml
             cat > compose.yaml << 'EOF'
             services:
               app:
-                image: ${{ env.IMAGE }}
+                image: ghcr.io/dxmbxx/resume-site:latest
                 restart: unless-stopped
-
               caddy:
                 image: caddy:2
                 restart: unless-stopped
@@ -72,12 +82,10 @@ jobs:
                   - caddy_config:/config
                 depends_on:
                   - app
-
             volumes:
               caddy_data:
               caddy_config:
             EOF
-
             docker compose pull
             docker compose up -d
             docker image prune -f
