@@ -19,6 +19,50 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # --- SAFE DIAGNOSTICS (no secret printing) ---
+      - name: Check secrets presence (safe)
+        shell: bash
+        run: |
+          set -e
+          for v in SSH_HOST SSH_USER SSH_KEY DOMAIN; do
+            if [ -z "${!v:-}" ]; then
+              echo "$v is EMPTY (not injected)"
+              exit 1
+            fi
+          done
+          echo "Secrets injected: YES"
+          echo "SSH_KEY length: ${#SSH_KEY}"
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+          DOMAIN: ${{ secrets.DOMAIN }}
+
+      - name: Validate SSH private key format (safe)
+        shell: bash
+        run: |
+          set -e
+          python3 - <<'PY'
+          import os, sys
+          k = os.environ.get("SSH_KEY","")
+          print("len=", len(k))
+          looks_public = k.strip().startswith("ssh-ed25519 ") or k.strip().startswith("ssh-rsa ")
+          has_openssh_private = "BEGIN OPENSSH PRIVATE KEY" in k
+          has_rsa_private = "BEGIN RSA PRIVATE KEY" in k
+          print("looks_like_public=", looks_public)
+          print("has_OPENSSH_PRIVATE=", has_openssh_private)
+          print("has_RSA_PRIVATE=", has_rsa_private)
+          first_line = k.splitlines()[0] if k.splitlines() else ""
+          print("first_line_tag=", first_line[:40])
+          if looks_public:
+          sys.exit("SSH_KEY looks like a PUBLIC key. Put private key (gh_deploy) into SSH_KEY secret.")
+          if not (has_openssh_private or has_rsa_private):
+          sys.exit("SSH_KEY is not a valid private key in expected OpenSSH/PEM format.")
+          PY
+        env:
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+
+      # --- BUILD & PUSH IMAGE ---
       - name: Login to GHCR
         uses: docker/login-action@v3
         with:
@@ -33,59 +77,70 @@ jobs:
           push: true
           tags: ${{ env.IMAGE }}
 
+      # --- SSH DEPLOY (no appleboy) ---
       - name: Write SSH key
         shell: bash
         run: |
           set -e
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
-          # ВАЖНО: сохраняем ключ как есть, с переносами строк
           cat > ~/.ssh/id_deploy <<'KEY'
           ${{ secrets.SSH_KEY }}
           KEY
           chmod 600 ~/.ssh/id_deploy
-          # опционально: выключаем StrictHostKeyChecking, чтобы не упираться в known_hosts
+          # avoid host key prompts in CI
           printf "Host *\n  StrictHostKeyChecking no\n  UserKnownHostsFile=/dev/null\n" > ~/.ssh/config
           chmod 600 ~/.ssh/config
 
-      - name: Deploy over SSH
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          port: 22
-          key: ${{ secrets.SSH_KEY }}
-          script: |
-            set -e
-            mkdir -p /opt/resume-site
-            cd /opt/resume-site
-            cat > Caddyfile << 'EOF'
-            ${{ secrets.DOMAIN }} {
-              encode gzip
-              reverse_proxy app:80
-            }
-            EOF
-            cat > compose.yaml << 'EOF'
-            services:
-              app:
-                image: ghcr.io/dxmbxx/resume-site:latest
-                restart: unless-stopped
-              caddy:
-                image: caddy:2
-                restart: unless-stopped
-                ports:
-                  - "80:80"
-                  - "443:443"
-                volumes:
-                  - ./Caddyfile:/etc/caddy/Caddyfile:ro
-                  - caddy_data:/data
-                  - caddy_config:/config
-                depends_on:
-                  - app
-            volumes:
-              caddy_data:
-              caddy_config:
-            EOF
-            docker compose pull
-            docker compose up -d
-            docker image prune -f
+      - name: SSH test
+        shell: bash
+        run: |
+          set -e
+          ssh -i ~/.ssh/id_deploy -p ${{ secrets.SSH_PORT || 22 }} \
+            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} "whoami && uname -a"
+
+      - name: Deploy
+        shell: bash
+        run: |
+          set -e
+          ssh -i ~/.ssh/id_deploy -p ${{ secrets.SSH_PORT || 22 }} \
+            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} <<'SSH'
+          set -e
+          mkdir -p /opt/resume-site
+          cd /opt/resume-site
+
+          cat > Caddyfile << 'EOF'
+          ${{ secrets.DOMAIN }} {
+            encode gzip
+            reverse_proxy app:80
+          }
+          EOF
+
+          cat > compose.yaml << 'EOF'
+          services:
+            app:
+              image: ${{ env.IMAGE }}
+              restart: unless-stopped
+
+            caddy:
+              image: caddy:2
+              restart: unless-stopped
+              ports:
+                - "80:80"
+                - "443:443"
+              volumes:
+                - ./Caddyfile:/etc/caddy/Caddyfile:ro
+                - caddy_data:/data
+                - caddy_config:/config
+              depends_on:
+                - app
+
+          volumes:
+            caddy_data:
+            caddy_config:
+          EOF
+
+          docker compose pull
+          docker compose up -d
+          docker image prune -f
+          SSH
