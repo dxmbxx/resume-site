@@ -1,0 +1,4 @@
+resume.parazm.ru {
+  encode gzip
+  reverse_proxy app:80
+}
